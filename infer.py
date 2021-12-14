@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import time
 
 import cv2
 import matplotlib.image as mpimg
@@ -21,18 +22,21 @@ from trt_pose.parse_objects import ParseObjects
 from gesture_classifier import gesture_classifier
 from preprocessdata import preprocessdata
 
+from camera import CameraThread
+
 device = torch.device("cuda")
 
-def preprocess(image):
-    mean = torch.Tensor([0.485, 0.456, 0.406]).cuda()
-    std = torch.Tensor([0.229, 0.224, 0.225]).cuda()
 
-    device = torch.device("cuda")
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = Image.fromarray(image)
-    image = transforms.functional.to_tensor(image).to(device)
-    image.sub_(mean[:, None, None]).div_(std[:, None, None])
-    return image[None, ...]
+def arr2batch(arr):
+
+    tensor_in = torch.from_numpy(arr).to("cuda")
+    tensor_in = tensor_in / 255.0
+    tensor_in = tensor_in - MEAN
+    tensor_in = tensor_in / STD
+    tensor_in = tensor_in.permute(2, 0, 1)  # HWC -> CWH
+    batch_in = tensor_in.unsqueeze(0)
+
+    return batch_in
 
 
 def draw_joints(image, joints):
@@ -55,6 +59,7 @@ def draw_joints(image, joints):
             (0, 255, 0),
             1,
         )
+
 
 def make_model():
 
@@ -87,11 +92,13 @@ if __name__ == "__main__":
     with open("preprocess/hand_pose.json", "r") as f:
         hand_pose = json.load(f)
 
+    cam = CameraThread(0, shape_in=(1920, 1080), shape_out=(224, 224))
+
     # TODO: not needed?
     topology = trt_pose.coco.coco_category_to_topology(hand_pose)
     num_parts = len(hand_pose["keypoints"])
     num_links = len(hand_pose["skeleton"])
-    model = trt_pose.models.resnet18_baseline_att(num_parts, 2 * num_links).cuda().eval()
+    # model = trt_pose.models.resnet18_baseline_att(num_parts, 2 * num_links).cuda().eval()
 
     preprocessdata = preprocessdata(topology, num_parts)
     gesture_classifier = gesture_classifier()
@@ -99,23 +106,54 @@ if __name__ == "__main__":
     parse_objects = ParseObjects(topology, cmap_threshold=0.15, link_threshold=0.15)
     draw_objects = DrawObjects(topology)
 
-    model_trt = make_model()
+    model_trt = make_model().eval()
+    tt = transforms.ToTensor()
 
-    while True:
-        print("heheszki")
-        img = Image.open("merkel.jpg")
-        # img = Image.open('hand.jpg')
-        arr = np.array(img)
-        cv2.imshow("angela", arr)
-        arr = cv2.resize(arr, (224, 224))
+    MEAN = torch.Tensor([0.485, 0.456, 0.406]).cuda()
+    STD = torch.Tensor([0.229, 0.224, 0.225]).cuda()
 
-        image = arr
-        data = preprocess(image)
-        cmap, paf = model_trt(data)
-        cmap, paf = cmap.detach().cpu(), paf.detach().cpu()
-        counts, objects, peaks = parse_objects(cmap, paf)
-        joints = preprocessdata.joints_inference(image, counts, objects, peaks)
-        draw_joints(image, joints)
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
-        cv2.imshow("joint", image)
-        cv2.waitKey(1)
+    try:
+        while True:
+            t0 = time.perf_counter()
+            arr = cam.image.copy()
+            t1 = time.perf_counter()
+
+            # Alternative, this takes 30ms or less:
+            # arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            # batch_in = arr2batch(arr)
+
+            tensor_in = transform(arr)
+            batch_in = tensor_in.unsqueeze(0)
+
+            t2 = time.perf_counter()
+            # batch_in_gpu = batch_in.cuda(non_blocking=True)
+            batch_in_gpu = batch_in.to("cuda")
+
+            t2_5 = time.perf_counter()
+            cmap, paf = model_trt(batch_in_gpu)
+            cmap, paf = cmap.detach().cpu(), paf.detach().cpu()
+            t3 = time.perf_counter()
+            counts, objects, peaks = parse_objects(cmap, paf)
+            joints = preprocessdata.joints_inference(arr, counts, objects, peaks)
+            t4 = time.perf_counter()
+            draw_joints(arr, joints)
+            t5 = time.perf_counter()
+            cv2.imshow("joint", arr)
+            cv2.waitKey(1)
+
+            print(f"Total: {1000 * (t5 - t0):0.2f}ms")
+            print(f"Image copy: {1000 * (t1 - t0):0.2f}ms")
+            print(f"Preprocessing: {1000 * (t2 - t1):0.2f}ms")
+            print(f".to(): {1000 * (t2_5 - t2):0.2f}ms")
+            print(f"Infer + CPU: {1000 * (t3 - t2):0.2f}ms")
+            print(f"Parsing + joint infer: {1000 * (t4 - t3):0.2f}ms")
+            print(f"CPU: {1000 * (t5 - t4):0.2f}ms")
+    finally:
+        cam.stop()
