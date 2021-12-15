@@ -19,17 +19,33 @@ from torch2trt import TRTModule
 from trt_pose.draw_objects import DrawObjects
 from trt_pose.parse_objects import ParseObjects
 
+from camera import CameraThread
 from gesture_classifier import gesture_classifier
 from preprocessdata import preprocessdata
 
-from camera import CameraThread
+DEVICE = torch.device("cuda:0")
 
-device = torch.device("cuda")
+WIDTH = 224
+HEIGHT = 224
+
+MEAN = torch.Tensor([0.485, 0.456, 0.406]).to(DEVICE)
+STD = torch.Tensor([0.229, 0.224, 0.225]).to(DEVICE)
 
 
 def arr2batch(arr):
+    # Takes: uint8 np array, e.g. (224,224,3)
+    # Outputs: torch float tensor, e.g. (1,3,224,224)
 
-    tensor_in = torch.from_numpy(arr).to("cuda")
+    # Equivalent to the code below
+    # (which for some reason this is painfully slow):
+    # transform = transforms.Compose(
+    #     [
+    #         transforms.ToTensor(),
+    #         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    #     ]
+    # )
+
+    tensor_in = torch.from_numpy(arr).to(DEVICE)
     tensor_in = tensor_in / 255.0
     tensor_in = tensor_in - MEAN
     tensor_in = tensor_in / STD
@@ -61,7 +77,16 @@ def draw_joints(image, joints):
         )
 
 
-def make_model():
+def classify_and_overlay(image, joints):
+    dist_bn_joints = preprocessdata.find_distance(joints)
+    gesture = clf.predict([dist_bn_joints, [0] * num_parts * num_parts])
+    gesture_joints = gesture[0]
+    preprocessdata.prev_queue.append(gesture_joints)
+    preprocessdata.prev_queue.pop(0)
+    preprocessdata.print_label(image, preprocessdata.prev_queue, gesture_type)
+
+
+def make_trt_model():
 
     # Read cached model if available
     PATH_TRT = "model/hand_pose_resnet18_att_244_244_trt.pth"
@@ -70,6 +95,12 @@ def make_model():
     if not os.path.exists(PATH_TRT):
         print("Converting model to TRT...")
         dummy_data = torch.zeros((1, 3, HEIGHT, WIDTH)).cuda()
+
+        model = (
+            trt_pose.models.resnet18_baseline_att(num_parts, 2 * num_links)
+            .cuda()
+            .eval()
+        )
         model.load_state_dict(torch.load(PATH_PT))
         model_trt = torch2trt.torch2trt(
             model, [dummy_data], fp16_mode=True, max_workspace_size=1 << 25
@@ -85,8 +116,6 @@ def make_model():
 
 
 if __name__ == "__main__":
-    WIDTH = 224
-    HEIGHT = 224
 
     # Info about output vector mapping to finger joints
     with open("preprocess/hand_pose.json", "r") as f:
@@ -94,66 +123,71 @@ if __name__ == "__main__":
 
     cam = CameraThread(0, shape_in=(1920, 1080), shape_out=(224, 224))
 
-    # TODO: not needed?
     topology = trt_pose.coco.coco_category_to_topology(hand_pose)
     num_parts = len(hand_pose["keypoints"])
     num_links = len(hand_pose["skeleton"])
-    # model = trt_pose.models.resnet18_baseline_att(num_parts, 2 * num_links).cuda().eval()
 
     preprocessdata = preprocessdata(topology, num_parts)
     gesture_classifier = gesture_classifier()
 
+    # Make praser and vis. funcs
     parse_objects = ParseObjects(topology, cmap_threshold=0.15, link_threshold=0.15)
     draw_objects = DrawObjects(topology)
 
-    model_trt = make_model().eval()
-    tt = transforms.ToTensor()
+    model_trt = make_trt_model().to(DEVICE).eval()
 
-    MEAN = torch.Tensor([0.485, 0.456, 0.406]).cuda()
-    STD = torch.Tensor([0.229, 0.224, 0.225]).cuda()
+    import pickle
 
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    filename = "svmmodel.sav"
+    clf = pickle.load(open(filename, "rb"))
+
+    with open("preprocess/gesture.json", "r") as f:
+        gesture = json.load(f)
+    gesture_type = gesture["classes"]
 
     try:
         while True:
+            # Start time
             t0 = time.perf_counter()
-            arr = cam.image.copy()
+
+            # Grab Frame
+            arr = cam.image
+            # arr = cv2.imread("merkel.jpg")
+            # arr = cv2.resize(arr, (224,224))
             t1 = time.perf_counter()
 
             # Alternative, this takes 30ms or less:
-            # arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-            # batch_in = arr2batch(arr)
-
-            tensor_in = transform(arr)
-            batch_in = tensor_in.unsqueeze(0)
-
+            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            batch_in = arr2batch(arr)
             t2 = time.perf_counter()
-            # batch_in_gpu = batch_in.cuda(non_blocking=True)
-            batch_in_gpu = batch_in.to("cuda")
 
-            t2_5 = time.perf_counter()
-            cmap, paf = model_trt(batch_in_gpu)
+            # Inference
+            cmap, paf = model_trt(batch_in)
             cmap, paf = cmap.detach().cpu(), paf.detach().cpu()
             t3 = time.perf_counter()
+
+            # Joints
             counts, objects, peaks = parse_objects(cmap, paf)
             joints = preprocessdata.joints_inference(arr, counts, objects, peaks)
             t4 = time.perf_counter()
-            draw_joints(arr, joints)
+
+            # Overlay
+            classify_and_overlay(arr, joints)
             t5 = time.perf_counter()
+
+            # Visualization
+            draw_joints(arr, joints)
             cv2.imshow("joint", arr)
             cv2.waitKey(1)
+            t6 = time.perf_counter()
 
-            print(f"Total: {1000 * (t5 - t0):0.2f}ms")
-            print(f"Image copy: {1000 * (t1 - t0):0.2f}ms")
-            print(f"Preprocessing: {1000 * (t2 - t1):0.2f}ms")
-            print(f".to(): {1000 * (t2_5 - t2):0.2f}ms")
-            print(f"Infer + CPU: {1000 * (t3 - t2):0.2f}ms")
-            print(f"Parsing + joint infer: {1000 * (t4 - t3):0.2f}ms")
-            print(f"CPU: {1000 * (t5 - t4):0.2f}ms")
+            print(f"Total                 : {1000 * (t5 - t0):0.2f}ms")
+            print(f"Image copy            : {1000 * (t1 - t0):0.2f}ms")
+            print(f"Preprocessing         : {1000 * (t2 - t1):0.2f}ms")
+            print(f"Infer + CPU           : {1000 * (t3 - t2):0.2f}ms")
+            print(f"Parsing + joint infer : {1000 * (t4 - t3):0.2f}ms")
+            print(f"Gesture classification: {1000 * (t5 - t4):0.2f}ms")
+            print(f"Visualization         : {1000 * (t6 - t5):0.2f}ms")
+            print(f"")
     finally:
         cam.stop()
